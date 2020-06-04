@@ -1,0 +1,134 @@
+import sys
+import argparse
+import requests
+import json
+import datetime
+import logging
+import http
+import collections
+
+# Avoid security exceptions/warnings
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Current module version
+__version__ = '0.1'
+
+def huHumanSize(bytes, units=[' bytes', ' KB', ' MB', ' GB', ' TB', ' PB', ' EB']):
+    if bytes == None:
+        return ''
+    return str(bytes) + units[0] if bytes < 1024 else huHumanSize(bytes >> 10, units[1:])
+
+def huHumanTimeMin(min, mil=False):
+    if (min == None):
+        return ''
+    if (mil == True):
+        if min < 1000:
+            return '%d msec' % (min)
+        min = min / 1000
+        if (min < 60):
+            return '%d sec' % (min)
+        min = min / 60
+    if (min < 60):
+        return '%d min' % (min)
+    min = min / 60
+    if (min < 24):
+        return '%d hours' % (min)
+    min = min / 24
+    return '%d days' % (min)
+
+def huRestGeneric(server, username, password, url, timeout, pagesize, qFilter='', returnRaw=False, \
+                  dateFrom=None, dateFromField=None, maxitems=None):
+
+    logging.info('huRestGeneric: {} (qFilter={}, dateFrom={}, dateFromField={}, max={})'.format( \
+        url, qFilter, dateFrom, dateFromField, maxitems))
+    # Paginated query results are collected in 'items' local variable
+    # 'retry' flag is used for acknowledging if we need to retry with the next timeout value
+    items = []
+    retry = True
+    pageNumber = 1
+    start = datetime.datetime.now()
+
+    # Educated guess for the timeout intervals, in general timeout=5 shoudl be working in 99%
+    retryTimeout = [timeout, timeout + 5, timeout + 15]
+    for tmout in retryTimeout:
+        # Check if the query was already successful (with the previous timeout prameter)
+        if retry == False:
+            break
+
+        # Reset the query parameters before the next REST call
+        response = None
+        retry = False
+
+        logging.info('GET {} timeout={} pagesize={} pagenumber={}'.format(url, tmout, pagesize, pageNumber))
+        while retry == False:
+            # Prepare the HTTP get request, paginated queries require non-'None' value
+            # No n-paginated queries return raw response value
+            if (pagesize == None):
+                requestUrl = "https://%s:8443/rest/v1.0/%s" % (server, url)
+            else:
+                requestUrl = "https://%s:8443/rest/v1.0/%spageSize=%d&pageNumber=%d%s" % (
+                server, url, pagesize, pageNumber, qFilter)
+            response = None
+            logging.info('huRestGeneric({})'.format(requestUrl))
+
+            # We need to catch at least the timeout exceptions
+            try:
+                retry = False
+                if (username == '-'):
+                    # Authorization through Bearer token
+                    response = requests.get(requestUrl, headers={"Authorization": "Bearer " + password}, cert="",
+                                            timeout=tmout, verify=False)
+                else:
+                    # Classic username/password authroization
+                    response = requests.get(requestUrl, auth=(username, password), cert="", timeout=tmout, verify=False)
+
+                if response.status_code != 200:
+                    logging.error(
+                        'Status {}: {}. {}'.format(response.status_code, http.client.responses[response.status_code],
+                                                   'Failed to retrieve REST results. Exiting...'))
+                    print('Status {}: {}. {}'.format(response.status_code, http.client.responses[response.status_code],
+                                                     'Failed to retrieve REST results. Exiting...'))
+                    # TODO: Raise exception here instead of exiting()
+                    exit()
+
+                # In case of a simple query, we already have the response
+                if returnRaw == True:
+                    logging.info('huRestGeneric({},timeout={}): OK'.format(url, tmout))
+                    return response
+
+            except Exception as err:
+                logging.debug('Exception: {}'.format(err))
+                # Something is wrong. Let's try again with the next timout value
+                retry = True
+                break
+
+            # In case of success, append the retrieved page of data to tbe result 'items'
+            if (retry == False):
+                data = response.json()
+                items += data['entities']
+                logging.debug('[Page {}] Retrieved {} of {} items in response'.format(pageNumber, len(items),
+                                                                                      data['metadata'][
+                                                                                          'totalEntityCount']))
+
+                # Exit the loop if we retrieved all of the items
+                if len(items) == (data['metadata']['totalEntityCount']):
+                    retry = False
+                    break
+                # Check if we achieved maxitems guideline, and return the results if true
+                if (maxitems != None) and maxitems < len(items):
+                    retry = False
+                    break
+                # Check if we achieved dateFrom guideline, and return the results if true
+                if dateFrom != None:
+                    datePage = datetime.datetime.fromtimestamp(int(data['entities'][-1][dateFromField] / 1e3))
+                    logging.debug('dateFrom={}, currentDate[{}]={}'.format(dateFrom, dateFromField, datePage))
+                    if (dateFrom != None) and (dateFromField != None) and (dateFrom > datePage):
+                        retry = False
+                        break
+                pageNumber += 1
+
+    logging.info(
+        'huRestGeneric({}, querylength={}): {} items '.format(url, datetime.datetime.now() - start, len(items)))
+    return response.status_code, items
